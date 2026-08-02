@@ -419,7 +419,7 @@ class AppTests(unittest.TestCase):
             self.app.players[slot] = player
             self.app.mac_to_slot[mac] = slot
         self.app._begin_match()
-        self.app.countdown_ms = 0
+        self.app._set_countdown(0, clock.now)
         self.app.player_x = 1.5
         self.app.player_y = 1.5
         self.app.player_heading = 0.0
@@ -494,6 +494,55 @@ class AppTests(unittest.TestCase):
         self.press("C")
         self.app.update(50)
         self.assertEqual(self.app.mode, game.MATCH)
+
+    def test_late_join_heartbeat_cannot_disconnect_match_client(self):
+        self.app._start_host()
+        peer = game.Player(1, b"\x01" * 6, "peer", clock.now)
+        self.app.players[1] = peer
+        self.app.mac_to_slot[peer.mac] = 1
+        peer.last_seen = clock.now - game.PEER_TIMEOUT_MS - 1
+        self.app._begin_match()
+
+        self.assertEqual(peer.last_seen, clock.now)
+        sent_before = len(fake_espnow.sent)
+        late_join = protocol.pack_join(self.app.session, 99, peer.name)
+        clock.advance(25)
+        self.app._on_radio(EspNowReceiveEvent(peer.mac, late_join))
+        self.assertEqual(self.app.mode, game.MATCH)
+        self.assertEqual(peer.last_seen, clock.now)
+        self.assertEqual(len(fake_espnow.sent), sent_before)
+
+        client = game.BadgeBludApp()
+        client.mode = game.MATCH
+        client.session = self.app.session
+        client.host_mac = self.app.local_mac
+        client.local_slot = 1
+        rejection = protocol.pack_reject(
+            client.session, 100, protocol.REJECT_STARTED
+        )
+        client._on_radio(EspNowReceiveEvent(client.host_mac, rejection))
+        self.assertEqual(client.mode, game.MATCH)
+
+    def test_countdown_uses_wall_clock_and_does_not_extend_input_lock(self):
+        self.make_host_match()
+        self.app._set_countdown(game.COUNTDOWN_MS, clock.now)
+        self.press("JOYUP")
+        before = (self.app.player_x, self.app.player_y)
+
+        # Simulate three seconds passing while startup radio work allows only
+        # one foreground update with a small scheduler delta.
+        clock.advance(game.COUNTDOWN_MS)
+        self.app.update(50)
+
+        self.assertEqual(self.app.countdown_ms, 0)
+        self.assertNotEqual((self.app.player_x, self.app.player_y), before)
+
+    def test_movement_catches_up_after_a_startup_frame_stall(self):
+        self.make_host_match()
+        self.press("JOYUP")
+        self.app.update(400)
+        self.assertAlmostEqual(self.app.player_x, 2.3, places=5)
+        self.assertAlmostEqual(self.app.player_y, 1.5, places=5)
 
     def test_touch_wrap_and_timeout(self):
         self.make_host_match()

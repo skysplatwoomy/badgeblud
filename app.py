@@ -46,6 +46,8 @@ POSE_INTERVAL_MS = 200
 SNAPSHOT_INTERVAL_MS = 200
 BEACON_INTERVAL_MS = 500
 SHOT_STALE_MS = 700
+MAX_MOVEMENT_DELTA_MS = 500
+MOVEMENT_STEP_SECONDS = 0.05
 GAME_CHANNEL = 6
 DAMAGE = 100
 
@@ -218,6 +220,7 @@ class BadgeBludApp(app.App):
         self.player_x, self.player_y, self.player_heading = engine.SPAWNS[0]
         self.map_open = False
         self.countdown_ms = 0
+        self.countdown_deadline = 0
         self.remaining_ms = MATCH_LENGTH_MS
         self.winner = None
         self.raycaster = engine.RayCaster()
@@ -421,6 +424,8 @@ class BadgeBludApp(app.App):
         self.host_mac = None
         self.hosts.clear()
         self.winner = None
+        self.countdown_ms = 0
+        self.countdown_deadline = 0
 
     def _start_host(self):
         if not self._claim_game_channel():
@@ -493,10 +498,14 @@ class BadgeBludApp(app.App):
             player.protected_until = _ticks_add(now, SPAWN_PROTECTION_MS)
             player.respawn_at = 0
             player.map_open = False
+            # A client may have sent its last lobby heartbeat just before the
+            # host pressed start. Give every accepted peer a full timeout
+            # window for its first in-match pose.
+            player.last_seen = now
         self._use_local_spawn(self.local_slot)
         self.mode = MATCH
         self.map_open = False
-        self.countdown_ms = COUNTDOWN_MS
+        self._set_countdown(COUNTDOWN_MS, now)
         self.remaining_ms = MATCH_LENGTH_MS
         self.winner = None
         start = protocol.pack_start(
@@ -508,6 +517,21 @@ class BadgeBludApp(app.App):
     def _use_local_spawn(self, slot, death_count=0):
         spawn = engine.SPAWNS[(slot + death_count) % len(engine.SPAWNS)]
         self.player_x, self.player_y, self.player_heading = spawn
+
+    def _set_countdown(self, duration_ms, now):
+        """Set a wall-clock countdown that cannot be stretched by slow frames."""
+        self.countdown_ms = max(0, int(duration_ms))
+        self.countdown_deadline = (
+            _ticks_add(now, self.countdown_ms) if self.countdown_ms else 0
+        )
+
+    def _refresh_countdown(self, now):
+        if not self.countdown_deadline:
+            self.countdown_ms = 0
+            return
+        self.countdown_ms = max(0, _ticks_diff(self.countdown_deadline, now))
+        if self.countdown_ms == 0:
+            self.countdown_deadline = 0
 
     def _find_free_slot(self):
         for slot in range(protocol.MAX_PLAYERS):
@@ -563,6 +587,13 @@ class BadgeBludApp(app.App):
     def _on_host_message(self, mac, message_type, payload, now):
         if message_type == protocol.JOIN:
             if self.mode != HOST_LOBBY:
+                # JOIN doubles as the client's lobby heartbeat. A heartbeat
+                # already queued when the host starts must not eject an
+                # accepted player during the countdown.
+                slot = self.mac_to_slot.get(mac)
+                if self.mode == MATCH and slot in self.players:
+                    self.players[slot].last_seen = now
+                    return
                 self._send(
                     protocol.pack_reject(
                         self.session, self._next_sequence(), protocol.REJECT_STARTED
@@ -630,7 +661,7 @@ class BadgeBludApp(app.App):
                 return
             self.status = "JOINED AS P%d" % (self.local_slot + 1)
             self._use_local_spawn(self.local_slot)
-        elif message_type == protocol.REJECT:
+        elif message_type == protocol.REJECT and self.mode == CLIENT_LOBBY:
             try:
                 reason = protocol.unpack_reject(payload)
             except protocol.ProtocolError:
@@ -643,13 +674,14 @@ class BadgeBludApp(app.App):
             self._reset_to_menu(labels.get(reason, "JOIN REJECTED"))
         elif message_type == protocol.START:
             try:
-                self.countdown_ms = protocol.unpack_start(payload)
+                countdown_ms = protocol.unpack_start(payload)
             except protocol.ProtocolError:
                 return
             self.mode = MATCH
             self.map_open = False
             self.remaining_ms = MATCH_LENGTH_MS
             self._use_local_spawn(self.local_slot)
+            self._set_countdown(countdown_ms, now)
         elif message_type == protocol.SNAPSHOT and self.mode in (CLIENT_LOBBY, MATCH):
             was_waiting = self.mode == CLIENT_LOBBY
             try:
@@ -659,7 +691,7 @@ class BadgeBludApp(app.App):
             if was_waiting:
                 # A snapshot is also a recovery path if both START copies were lost.
                 self.mode = MATCH
-                self.countdown_ms = 0
+                self._set_countdown(0, now)
         elif message_type == protocol.HIT and self.mode == MATCH:
             try:
                 attacker, victim, health = protocol.unpack_hit(payload)
@@ -755,19 +787,29 @@ class BadgeBludApp(app.App):
         if "A" in self.held:
             strafe = turn
             turn = 0
-        self.player_heading = engine.wrap_angle(
-            self.player_heading + turn * 2.0 * dt
-        )
+        if not turn and not forward and not strafe:
+            self._sync_local_player(now)
+            return
         forward_speed = 2.0 if forward >= 0 else 1.4
-        forward_amount = forward * forward_speed * dt
-        strafe_amount = strafe * 1.6 * dt
-        cosine = math.cos(self.player_heading)
-        sine = math.sin(self.player_heading)
-        dx = cosine * forward_amount - sine * strafe_amount
-        dy = sine * forward_amount + cosine * strafe_amount
-        self.player_x, self.player_y = engine.move_with_collision(
-            self.player_x, self.player_y, dx, dy
-        )
+        # Preserve held-input distance when a startup radio burst delays a
+        # foreground frame. Small collision steps avoid tunnelling through a
+        # wall while catching up.
+        remaining = dt
+        while remaining > 0:
+            step = min(MOVEMENT_STEP_SECONDS, remaining)
+            self.player_heading = engine.wrap_angle(
+                self.player_heading + turn * 2.0 * step
+            )
+            forward_amount = forward * forward_speed * step
+            strafe_amount = strafe * 1.6 * step
+            cosine = math.cos(self.player_heading)
+            sine = math.sin(self.player_heading)
+            dx = cosine * forward_amount - sine * strafe_amount
+            dy = sine * forward_amount + cosine * strafe_amount
+            self.player_x, self.player_y = engine.move_with_collision(
+                self.player_x, self.player_y, dx, dy
+            )
+            remaining -= step
         self._sync_local_player(now)
 
     def _fire(self, now):
@@ -946,7 +988,7 @@ class BadgeBludApp(app.App):
             self.minimise()
             return False
 
-        dt_ms = max(0, min(100, int(delta)))
+        dt_ms = max(0, min(MAX_MOVEMENT_DELTA_MS, int(delta)))
         dt = dt_ms * 0.001
         self.muzzle_ms = max(0, self.muzzle_ms - dt_ms)
         self.hit_ms = max(0, self.hit_ms - dt_ms)
@@ -958,9 +1000,8 @@ class BadgeBludApp(app.App):
         elif self.mode == MATCH:
             if "B" in self.pressed:
                 self.map_open = not self.map_open
-            if self.countdown_ms > 0:
-                self.countdown_ms = max(0, self.countdown_ms - dt_ms)
-            else:
+            self._refresh_countdown(now)
+            if self.countdown_ms <= 0:
                 self._update_movement(dt, now)
                 if "C" in self.pressed:
                     self._fire(now)
