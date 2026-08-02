@@ -42,13 +42,12 @@ FIRE_COOLDOWN_MS = 350
 RESPAWN_MS = 2000
 SPAWN_PROTECTION_MS = 1000
 PEER_TIMEOUT_MS = 3000
-POSE_INTERVAL_MS = 100
-SNAPSHOT_INTERVAL_MS = 100
+POSE_INTERVAL_MS = 200
+SNAPSHOT_INTERVAL_MS = 200
 BEACON_INTERVAL_MS = 500
 SHOT_STALE_MS = 700
 GAME_CHANNEL = 6
 DAMAGE = 100
-REMOTE_SMOOTH_RATE = 10.0
 
 PLAYER_COLOURS = (
     (0.20, 0.92, 1.00),
@@ -127,9 +126,6 @@ class Player:
         "x",
         "y",
         "heading",
-        "render_x",
-        "render_y",
-        "render_heading",
         "health",
         "kills",
         "deaths",
@@ -147,9 +143,6 @@ class Player:
         self.mac = mac
         self.name = name
         self.x, self.y, self.heading = engine.SPAWNS[slot]
-        self.render_x = self.x
-        self.render_y = self.y
-        self.render_heading = self.heading
         self.health = 100
         self.kills = 0
         self.deaths = 0
@@ -192,7 +185,7 @@ class Player:
 
 
 class BadgeBludApp(app.App):
-    """Host-authoritative local-radio deathmatch."""
+    """Client-authoritative movement with host-owned combat state."""
 
     def __init__(self):
         super().__init__()
@@ -492,9 +485,6 @@ class BadgeBludApp(app.App):
         now = _ticks_ms()
         for slot, player in self.players.items():
             player.x, player.y, player.heading = engine.SPAWNS[slot]
-            player.render_x = player.x
-            player.render_y = player.y
-            player.render_heading = player.heading
             player.health = 100
             player.kills = 0
             player.deaths = 0
@@ -616,16 +606,12 @@ class BadgeBludApp(app.App):
                 x, y, heading, flags = protocol.unpack_pose(payload)
             except protocol.ProtocolError:
                 return
-            if engine.position_is_open(x, y):
-                player.x = x
-                player.y = y
+            # Movement and aim are fully client authoritative. The host stores
+            # and relays the newest pose without collision, bounds, or heading
+            # validation.
+            player.x = x
+            player.y = y
             player.heading = heading
-            dx = player.x - player.render_x
-            dy = player.y - player.render_y
-            if dx * dx + dy * dy > 16.0:
-                player.render_x = player.x
-                player.render_y = player.y
-                player.render_heading = player.heading
             player.map_open = bool(flags & protocol.FLAG_MAP_OPEN)
         elif message_type == protocol.FIRE and self.mode == MATCH:
             try:
@@ -701,7 +687,6 @@ class BadgeBludApp(app.App):
             slot = data["slot"]
             seen.add(slot)
             player = self.players.get(slot)
-            is_new = player is None
             was_dead = player.dead if player is not None else False
             if player is None:
                 player = Player(slot, data["mac"], data["name"], now)
@@ -723,21 +708,9 @@ class BadgeBludApp(app.App):
                     self.player_x = player.x
                     self.player_y = player.y
                     self.player_heading = player.heading
-                elif not player.dead and not engine.position_is_open(
-                    self.player_x, self.player_y
-                ):
-                    self.player_x = player.x
-                    self.player_y = player.y
                 player.x = self.player_x
                 player.y = self.player_y
                 player.heading = self.player_heading
-                player.render_x = self.player_x
-                player.render_y = self.player_y
-                player.render_heading = self.player_heading
-            elif is_new or was_dead != player.dead:
-                player.render_x = player.x
-                player.render_y = player.y
-                player.render_heading = player.heading
         for slot in tuple(self.players):
             if slot not in seen:
                 del self.players[slot]
@@ -765,9 +738,6 @@ class BadgeBludApp(app.App):
         player.x = self.player_x
         player.y = self.player_y
         player.heading = self.player_heading
-        player.render_x = self.player_x
-        player.render_y = self.player_y
-        player.render_heading = self.player_heading
         player.map_open = self.map_open
         player.last_seen = now
 
@@ -800,19 +770,6 @@ class BadgeBludApp(app.App):
         )
         self._sync_local_player(now)
 
-    def _smooth_remote_players(self, dt):
-        amount = min(1.0, REMOTE_SMOOTH_RATE * dt)
-        for slot, player in self.players.items():
-            if slot == self.local_slot:
-                continue
-            player.render_x += (player.x - player.render_x) * amount
-            player.render_y += (player.y - player.render_y) * amount
-            player.render_heading = engine.wrap_angle(
-                player.render_heading
-                + engine.angle_difference(player.heading, player.render_heading)
-                * amount
-            )
-
     def _fire(self, now):
         if self.map_open or self.countdown_ms > 0:
             return
@@ -835,8 +792,6 @@ class BadgeBludApp(app.App):
         if shooter is None or shooter.dead or shooter.map_open:
             return None
         if shooter.last_fire is not None and _ticks_diff(now, shooter.last_fire) < FIRE_COOLDOWN_MS:
-            return None
-        if abs(engine.angle_difference(shot_heading, shooter.heading)) > 0.55:
             return None
         shooter.last_fire = now
         targets = []
@@ -885,9 +840,6 @@ class BadgeBludApp(app.App):
                 player.health = 100
                 player.dead = False
                 player.streak = 0
-                player.render_x = player.x
-                player.render_y = player.y
-                player.render_heading = player.heading
                 player.protected_until = _ticks_add(now, SPAWN_PROTECTION_MS)
                 player.respawn_at = 0
                 if player.slot == self.local_slot:
@@ -1012,7 +964,6 @@ class BadgeBludApp(app.App):
                 self._update_movement(dt, now)
                 if "C" in self.pressed:
                     self._fire(now)
-            self._smooth_remote_players(dt)
         elif self.mode == RESULTS and "C" in self.pressed:
             self._reset_to_menu("MATCH COMPLETE")
 
@@ -1117,8 +1068,8 @@ class BadgeBludApp(app.App):
         for slot, player in self.players.items():
             if slot == self.local_slot or player.dead:
                 continue
-            dx = player.render_x - self.player_x
-            dy = player.render_y - self.player_y
+            dx = player.x - self.player_x
+            dy = player.y - self.player_y
             forward = dx * cosine + dy * sine
             lateral = -dx * sine + dy * cosine
             if forward <= 0.15:
@@ -1187,15 +1138,15 @@ class BadgeBludApp(app.App):
             )
         ctx.fill()
         for slot, player in self.players.items():
-            x = origin_x + player.render_x * scale
-            y = origin_y + player.render_y * scale
+            x = origin_x + player.x * scale
+            y = origin_y + player.y * scale
             size = 6.5 if slot == self.local_slot else 5.0
-            cosine = math.cos(player.render_heading)
-            sine = math.sin(player.render_heading)
+            cosine = math.cos(player.heading)
+            sine = math.sin(player.heading)
             ctx.rgb(*PLAYER_COLOURS[slot]).begin_path()
             ctx.move_to(x + cosine * size, y + sine * size)
-            ctx.line_to(x + math.cos(player.render_heading + 2.45) * size, y + math.sin(player.render_heading + 2.45) * size)
-            ctx.line_to(x + math.cos(player.render_heading - 2.45) * size, y + math.sin(player.render_heading - 2.45) * size)
+            ctx.line_to(x + math.cos(player.heading + 2.45) * size, y + math.sin(player.heading + 2.45) * size)
+            ctx.line_to(x + math.cos(player.heading - 2.45) * size, y + math.sin(player.heading - 2.45) * size)
             ctx.close_path().fill()
 
     @staticmethod

@@ -634,31 +634,45 @@ class AppTests(unittest.TestCase):
         triangle_count = sum(1 for name, _ in ctx.operations if name == "close_path")
         self.assertEqual(triangle_count, 4)
 
-    def test_remote_snapshots_interpolate_without_changing_authoritative_pose(self):
+    def test_client_pose_is_relayed_without_host_validation_at_five_hz(self):
         self.make_host_match()
         remote = self.app.players[1]
-        remote.x = 3.5
-        remote.y = 1.5
-        remote.heading = 0.0
-        remote.render_x = 3.5
-        remote.render_y = 1.5
-        remote.render_heading = 0.0
-        remote.x = 4.5
-        remote.y = 2.5
-        remote.heading = math.pi / 2
-        self.app._smooth_remote_players(0.05)
-        self.assertEqual((remote.x, remote.y), (4.5, 2.5))
-        self.assertAlmostEqual(remote.render_x, 4.0)
-        self.assertAlmostEqual(remote.render_y, 2.0)
-        self.assertAlmostEqual(remote.render_heading, math.pi / 4)
+        payload = protocol.pack_pose(
+            self.app.session, 40, -20.0, 30.0, 2.25, 0
+        )
+        self.app._on_radio(EspNowReceiveEvent(remote.mac, payload))
+        self.assertAlmostEqual(remote.x, -20.0)
+        self.assertAlmostEqual(remote.y, 30.0)
+        self.assertAlmostEqual(remote.heading, 2.25, places=3)
+
+        self.app._broadcast_snapshot(clock.now)
+        kind, _, _, snapshot_payload = protocol.parse(fake_espnow.sent[-1][0])
+        self.assertEqual(kind, protocol.SNAPSHOT)
+        _, players = protocol.unpack_snapshot(snapshot_payload)
+        relayed = next(player for player in players if player["slot"] == 1)
+        self.assertAlmostEqual(relayed["x"], -20.0)
+        self.assertAlmostEqual(relayed["y"], 30.0)
 
     def test_game_radio_filters_foreign_espnow_traffic(self):
         self.app._start_host()
         _, _, predicate = fake_espnow.subscriptions[-1]
         self.assertTrue(predicate(EspNowReceiveEvent(b"\x01" * 6, b"BBpayload")))
         self.assertFalse(predicate(EspNowReceiveEvent(b"\x01" * 6, b"other-app")))
-        self.assertEqual(game.POSE_INTERVAL_MS, 100)
-        self.assertEqual(game.SNAPSHOT_INTERVAL_MS, 100)
+        self.assertEqual(game.POSE_INTERVAL_MS, 200)
+        self.assertEqual(game.SNAPSHOT_INTERVAL_MS, 200)
+
+    def test_host_does_not_validate_shot_aim_against_last_pose(self):
+        self.make_host_match()
+        shooter = self.app.players[1]
+        shooter.x = 4.5
+        shooter.y = 1.5
+        shooter.heading = 0.0
+        self.app.players[0].x = 1.5
+        self.app.players[0].y = 1.5
+        self.assertEqual(
+            self.app._resolve_shot(1, math.pi, clock.now),
+            0,
+        )
 
     def test_duplicate_fire_and_stale_peer_are_rejected(self):
         self.make_host_match()
