@@ -289,8 +289,51 @@ class EngineTests(unittest.TestCase):
         depth_identity = id(caster.depths)
         depths, shades = caster.cast(1.5, 1.5, 0.0)
         self.assertEqual(id(depths), depth_identity)
-        self.assertEqual(len(depths), 40)
+        self.assertEqual(len(depths), 32)
         self.assertTrue(all(0 <= shade <= 5 for shade in shades))
+
+    def test_precomputed_raycaster_matches_reference_columns(self):
+        caster = engine.RayCaster()
+        divisor = max(1, caster.count - 1)
+        samples = (
+            (1.5, 1.5, 0.0),
+            (5.5, 5.5, 0.73),
+            (8.5, 8.5, -1.41),
+            (11.5, 5.5, math.pi),
+        )
+        for x, y, heading in samples:
+            depths, shades = caster.cast(x, y, heading)
+            for index in range(caster.count):
+                offset = -engine.FOV * 0.5 + engine.FOV * index / divisor
+                raw_distance, side = engine.cast_ray(x, y, heading + offset)
+                expected_depth = max(0.01, raw_distance * math.cos(offset))
+                expected_shade = int(expected_depth * 0.8) + (1 if side else 0)
+                expected_shade = int(engine.clamp(expected_shade, 0, 5))
+                self.assertAlmostEqual(depths[index], expected_depth, places=5)
+                self.assertEqual(shades[index], expected_shade)
+
+    def test_active_raycaster_avoids_extra_fisheye_trigonometry(self):
+        caster = engine.RayCaster()
+        original_cosine = engine.math.cos
+        original_sine = engine.math.sin
+        calls = {"cos": 0, "sin": 0}
+
+        def counted_cosine(value):
+            calls["cos"] += 1
+            return original_cosine(value)
+
+        def counted_sine(value):
+            calls["sin"] += 1
+            return original_sine(value)
+
+        engine.math.cos = counted_cosine
+        engine.math.sin = counted_sine
+        try:
+            caster.cast(1.5, 1.5, 0.37)
+        finally:
+            engine.math.cos = original_cosine
+            engine.math.sin = original_sine
+        self.assertEqual(calls, {"cos": caster.count, "sin": caster.count})
 
 
 class ProtocolTests(unittest.TestCase):
@@ -544,6 +587,43 @@ class AppTests(unittest.TestCase):
         self.assertAlmostEqual(self.app.player_x, 2.3, places=5)
         self.assertAlmostEqual(self.app.player_y, 1.5, places=5)
 
+    def test_static_match_skips_draws_until_visible_state_changes(self):
+        self.make_host_match()
+        self.app.remaining_ms = game.MATCH_LENGTH_MS - 100
+        self.app._refresh_hud_cache()
+        self.app.render_dirty = False
+        self.assertFalse(self.app.update(50))
+
+        self.press("JOYUP")
+        self.assertTrue(self.app.update(50))
+        self.release("JOYUP")
+
+        self.app._refresh_hud_cache()
+        self.app.render_dirty = False
+        remote = self.app.players[1]
+        pose = protocol.pack_pose(
+            self.app.session,
+            200,
+            remote.x + 0.25,
+            remote.y,
+            remote.heading,
+            0,
+        )
+        self.app._on_radio(EspNowReceiveEvent(remote.mac, pose))
+        self.assertTrue(self.app.update(50))
+
+    def test_hud_text_is_reused_within_displayed_second(self):
+        self.make_host_match()
+        self.app.remaining_ms = game.MATCH_LENGTH_MS - 100
+        self.app._refresh_hud_cache()
+        text_before = self.app.hud_text
+        self.app.remaining_ms -= 50
+        self.app._refresh_hud_cache()
+        self.assertIs(self.app.hud_text, text_before)
+        self.app.players[0].kills += 1
+        self.app._refresh_hud_cache()
+        self.assertIsNot(self.app.hud_text, text_before)
+
     def test_touch_wrap_and_timeout(self):
         self.make_host_match()
         self.app.player_heading = 0.0
@@ -629,6 +709,53 @@ class AppTests(unittest.TestCase):
         self.assertEqual(opponent.health, 100)
         self.assertEqual(opponent.streak, 0)
         self.assertNotEqual((opponent.x, opponent.y), (4.5, 1.5))
+
+    def test_stale_dead_pose_cannot_overwrite_respawn_position(self):
+        self.make_host_match()
+        remote = self.app.players[1]
+        death_position = (4.5, 5.5)
+        remote.x, remote.y = death_position
+        remote.dead = True
+        remote.health = 0
+        remote.respawn_at = clock.now + game.RESPAWN_MS
+
+        # A pose queued before the client learns it died is rejected while the
+        # host still owns the dead state.
+        live_stale = protocol.pack_pose(
+            self.app.session,
+            100,
+            death_position[0] + 0.5,
+            death_position[1],
+            0.3,
+            0,
+        )
+        self.app._on_radio(EspNowReceiveEvent(remote.mac, live_stale))
+        self.assertEqual((remote.x, remote.y), death_position)
+
+        clock.advance(game.RESPAWN_MS)
+        self.app._update_respawns(clock.now)
+        spawn_position = (remote.x, remote.y)
+        self.assertNotEqual(spawn_position, death_position)
+
+        # Until the client receives that respawn snapshot it reports itself as
+        # dead and may still send the old coordinates. Those must not flash at
+        # the death location on other badges.
+        dead_stale = protocol.pack_pose(
+            self.app.session,
+            101,
+            death_position[0],
+            death_position[1],
+            0.3,
+            protocol.FLAG_DEAD,
+        )
+        self.app._on_radio(EspNowReceiveEvent(remote.mac, dead_stale))
+        self.assertEqual((remote.x, remote.y), spawn_position)
+
+        acknowledged = protocol.pack_pose(
+            self.app.session, 102, spawn_position[0] + 0.25, spawn_position[1], 0.3, 0
+        )
+        self.app._on_radio(EspNowReceiveEvent(remote.mac, acknowledged))
+        self.assertAlmostEqual(remote.x, spawn_position[0] + 0.25)
 
     def test_host_join_capacity_and_late_join(self):
         self.app._start_host()
@@ -768,6 +895,50 @@ class AppTests(unittest.TestCase):
         self.app._start_host()
         self.assertIsNotNone(self.app.radio_handler)
 
+    def test_f_exit_reopens_as_a_fresh_main_menu(self):
+        self.make_host_match()
+        self.app.hosts[b"\xaa" * 6] = {"name": "stale"}
+        self.app.map_open = True
+        self.app.remaining_ms = 12345
+        self.app.muzzle_ms = 99
+        self.app.hit_ms = 88
+        self.app.notice = "STALE NOTICE"
+        self.press("JOYUP")
+        self.press("TOUCH03")
+        self.press("F")
+
+        self.assertTrue(self.app.update(50))
+        self.assertTrue(self.app.minimised)
+        self.assertEqual(self.app.mode, game.MENU)
+        self.assertEqual(self.app.menu_index, 0)
+        self.assertEqual(self.app.status, "HOST OR JOIN")
+        self.assertFalse(self.app.session)
+        self.assertFalse(self.app.players)
+        self.assertFalse(self.app.hosts)
+        self.assertIsNone(self.app.host_mac)
+        self.assertEqual(self.app.local_slot, 0)
+        self.assertEqual(
+            (self.app.player_x, self.app.player_y, self.app.player_heading),
+            engine.SPAWNS[0],
+        )
+        self.assertEqual(self.app.remaining_ms, game.MATCH_LENGTH_MS)
+        self.assertEqual((self.app.muzzle_ms, self.app.hit_ms), (0, 0))
+        self.assertEqual(self.app.notice, "")
+        self.assertFalse(self.app.held)
+        self.assertFalse(self.app.pressed)
+        self.assertFalse(self.app.touch_held)
+        self.assertIsNone(self.app.radio_handler)
+
+        # The scheduler foregrounds this same cached instance on relaunch.
+        self.app.minimised = False
+        self.assertTrue(self.app.update(50))
+        ctx = FakeCtx()
+        self.app.draw(ctx)
+        texts = [values[0] for name, values in ctx.operations if name == "text"]
+        self.assertIn("BADGEBLUD", texts)
+        self.assertTrue(any("HOST MATCH" in value for value in texts))
+        self.assertTrue(any("JOIN MATCH" in value for value in texts))
+
     def test_world_and_map_draws_are_balanced_and_within_budget(self):
         self.make_host_match(opponents=3)
         positions = ((1.5, 1.5), (3.5, 1.5), (5.5, 1.5), (8.5, 1.5))
@@ -781,7 +952,7 @@ class AppTests(unittest.TestCase):
             self.assertEqual(ctx.depth, 0)
             self.assertLessEqual(
                 len(ctx.operations),
-                100,
+                100 if map_open else 75,
                 "map=%s used %d operations" % (map_open, len(ctx.operations)),
             )
 

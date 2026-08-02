@@ -5,7 +5,7 @@ import math
 
 TAU = 2.0 * math.pi
 FOV = math.pi / 3.0
-RAY_COUNT = 40
+RAY_COUNT = 32
 MAX_RAY_DISTANCE = 20.0
 PLAYER_RADIUS = 0.20
 HIT_RADIUS = 0.32
@@ -119,25 +119,78 @@ def cast_ray(x, y, angle, maximum=MAX_RAY_DISTANCE):
 
 
 class RayCaster:
-    """A preallocated forty-column ray caster."""
+    """A preallocated ray caster with fixed column vectors."""
 
     def __init__(self, count=RAY_COUNT):
         self.count = count
         self.depths = [MAX_RAY_DISTANCE] * count
         self.shades = [0] * count
+        divisor = max(1, count - 1)
+        self.angle_step = FOV / divisor
+        self.offset_cosines = [0.0] * count
+        for index in range(count):
+            offset = -FOV * 0.5 + FOV * index / divisor
+            self.offset_cosines[index] = math.cos(offset)
 
     def cast(self, x, y, heading):
-        start = heading - FOV * 0.5
-        divisor = max(1, self.count - 1)
+        ray_angle = heading - FOV * 0.5
+        origin_map_x = int(math.floor(x))
+        origin_map_y = int(math.floor(y))
+        cosine = math.cos
+        sine = math.sin
+        arena = ARENA
+        map_width = MAP_WIDTH
+        map_height = MAP_HEIGHT
         for index in range(self.count):
-            ray_angle = start + FOV * index / divisor
-            raw_distance, side = cast_ray(x, y, ray_angle)
-            corrected = raw_distance * math.cos(ray_angle - heading)
-            self.depths[index] = max(0.01, corrected)
+            ray_x = cosine(ray_angle)
+            ray_y = sine(ray_angle)
+            map_x = origin_map_x
+            map_y = origin_map_y
+            delta_x = abs(1.0 / ray_x) if abs(ray_x) > 0.000001 else 1000000.0
+            delta_y = abs(1.0 / ray_y) if abs(ray_y) > 0.000001 else 1000000.0
+            if ray_x < 0.0:
+                step_x = -1
+                side_x = (x - map_x) * delta_x
+            else:
+                step_x = 1
+                side_x = (map_x + 1.0 - x) * delta_x
+            if ray_y < 0.0:
+                step_y = -1
+                side_y = (y - map_y) * delta_y
+            else:
+                step_y = 1
+                side_y = (map_y + 1.0 - y) * delta_y
+
+            raw_distance = 0.0
+            side = 0
+            while raw_distance <= MAX_RAY_DISTANCE:
+                if side_x < side_y:
+                    map_x += step_x
+                    raw_distance = side_x
+                    side_x += delta_x
+                    side = 0
+                else:
+                    map_y += step_y
+                    raw_distance = side_y
+                    side_y += delta_y
+                    side = 1
+                if (
+                    map_x < 0
+                    or map_y < 0
+                    or map_x >= map_width
+                    or map_y >= map_height
+                    or arena[map_y][map_x] == "#"
+                ):
+                    if raw_distance > MAX_RAY_DISTANCE:
+                        raw_distance = MAX_RAY_DISTANCE
+                    break
+            corrected = raw_distance * self.offset_cosines[index]
+            self.depths[index] = corrected if corrected > 0.01 else 0.01
             shade = int(corrected * 0.8)
             if side:
                 shade += 1
-            self.shades[index] = int(clamp(shade, 0, 5))
+            self.shades[index] = 5 if shade > 5 else shade
+            ray_angle += self.angle_step
         return self.depths, self.shades
 
 

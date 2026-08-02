@@ -67,6 +67,11 @@ WALL_COLOURS = (
     (0.06, 0.23, 0.35),
 )
 
+PROJECTION_FOCAL = 120.0 / math.tan(engine.FOV * 0.5)
+MAP_ARROW_ANGLE = 2.45
+MAP_ARROW_COSINE = math.cos(MAP_ARROW_ANGLE)
+MAP_ARROW_SINE = math.sin(MAP_ARROW_ANGLE)
+
 
 def _ticks_ms():
     if hasattr(time, "ticks_ms"):
@@ -224,9 +229,21 @@ class BadgeBludApp(app.App):
         self.remaining_ms = MATCH_LENGTH_MS
         self.winner = None
         self.raycaster = engine.RayCaster()
+        self.column_width = 240.0 / self.raycaster.count
+        self.column_x = [
+            -120.0 + index * self.column_width
+            for index in range(self.raycaster.count)
+        ]
+        self.visible_players = []
         self.muzzle_ms = 0
         self.hit_ms = 0
         self.notice = ""
+        self.render_dirty = True
+        self.countdown_digit = None
+        self.hud_health = -1
+        self.hud_kills = -1
+        self.hud_second = -1
+        self.hud_text = ""
 
         now = _ticks_ms()
         self.last_beacon = now - BEACON_INTERVAL_MS
@@ -362,6 +379,7 @@ class BadgeBludApp(app.App):
             return
         self.held.add(name)
         self.pressed.add(name)
+        self.render_dirty = True
         number = _touch_number(name)
         if number is not None:
             self.touch_held.add(number)
@@ -392,12 +410,7 @@ class BadgeBludApp(app.App):
         self.last_touch = None
 
     def minimise(self):
-        self._leave_session()
-        self.mode = MENU
-        self.menu_index = 0
-        self.status = "HOST OR JOIN"
-        self._clear_inputs()
-        self._release_radio()
+        self._reset_to_menu()
         super().minimise()
 
     def _leave_session(self):
@@ -418,14 +431,34 @@ class BadgeBludApp(app.App):
 
     def _reset_to_menu(self, status="HOST OR JOIN"):
         self._leave_session()
+        now = _ticks_ms()
         self.mode = MENU
         self.menu_index = 0
         self.status = status
+        self.sequence = 0
+        self.local_slot = 0
         self.host_mac = None
         self.hosts.clear()
+        self.host_selection = 0
+        self.last_host_seen = 0
         self.winner = None
+        self._use_local_spawn(0)
         self.countdown_ms = 0
         self.countdown_deadline = 0
+        self.countdown_digit = None
+        self.remaining_ms = MATCH_LENGTH_MS
+        self.muzzle_ms = 0
+        self.hit_ms = 0
+        self.notice = ""
+        self.last_beacon = now - BEACON_INTERVAL_MS
+        self.last_pose = now - POSE_INTERVAL_MS
+        self.last_snapshot = now - SNAPSHOT_INTERVAL_MS
+        self.hud_health = -1
+        self.hud_kills = -1
+        self.hud_second = -1
+        self.hud_text = ""
+        self._clear_inputs()
+        self.render_dirty = True
 
     def _start_host(self):
         if not self._claim_game_channel():
@@ -524,6 +557,8 @@ class BadgeBludApp(app.App):
         self.countdown_deadline = (
             _ticks_add(now, self.countdown_ms) if self.countdown_ms else 0
         )
+        self.countdown_digit = None
+        self.render_dirty = True
 
     def _refresh_countdown(self, now):
         if not self.countdown_deadline:
@@ -532,6 +567,10 @@ class BadgeBludApp(app.App):
         self.countdown_ms = max(0, _ticks_diff(self.countdown_deadline, now))
         if self.countdown_ms == 0:
             self.countdown_deadline = 0
+        digit = (self.countdown_ms + 999) // 1000 if self.countdown_ms else 0
+        if digit != self.countdown_digit:
+            self.countdown_digit = digit
+            self.render_dirty = True
 
     def _find_free_slot(self):
         for slot in range(protocol.MAX_PLAYERS):
@@ -560,6 +599,7 @@ class BadgeBludApp(app.App):
                     "seen": now,
                 }
                 self.status = "HOSTS FOUND %d" % len(self.hosts)
+                self.render_dirty = True
             elif (
                 self.mode == CLIENT_LOBBY
                 and event.mac == self.host_mac
@@ -577,6 +617,7 @@ class BadgeBludApp(app.App):
         if not _sequence_is_new(sequence, previous):
             return
         self.last_sequences[key] = sequence
+        self.render_dirty = True
 
         if self.is_host:
             self._on_host_message(event.mac, message_type, payload, now)
@@ -636,6 +677,11 @@ class BadgeBludApp(app.App):
             try:
                 x, y, heading, flags = protocol.unpack_pose(payload)
             except protocol.ProtocolError:
+                return
+            # A dead client keeps sending its last pose until it receives the
+            # host's respawn snapshot. Never let that stale death position
+            # overwrite the host-selected spawn in the intervening radio gap.
+            if player.dead or flags & protocol.FLAG_DEAD:
                 return
             # Movement and aim are fully client authoritative. The host stores
             # and relays the newest pose without collision, bounds, or heading
@@ -776,7 +822,7 @@ class BadgeBludApp(app.App):
     def _update_movement(self, dt, now):
         player = self._local_player()
         if player is not None and player.dead:
-            return
+            return False
         turn = (1 if "JOYRIGHT" in self.held else 0) - (
             1 if "JOYLEFT" in self.held else 0
         )
@@ -789,12 +835,33 @@ class BadgeBludApp(app.App):
             turn = 0
         if not turn and not forward and not strafe:
             self._sync_local_player(now)
-            return
+            return False
+        if not forward and not strafe:
+            self.player_heading = engine.wrap_angle(
+                self.player_heading + turn * 2.0 * dt
+            )
+            self._sync_local_player(now)
+            return True
         forward_speed = 2.0 if forward >= 0 else 1.4
         # Preserve held-input distance when a startup radio burst delays a
         # foreground frame. Small collision steps avoid tunnelling through a
         # wall while catching up.
         remaining = dt
+        if not turn:
+            cosine = math.cos(self.player_heading)
+            sine = math.sin(self.player_heading)
+            while remaining > 0:
+                step = min(MOVEMENT_STEP_SECONDS, remaining)
+                forward_amount = forward * forward_speed * step
+                strafe_amount = strafe * 1.6 * step
+                dx = cosine * forward_amount - sine * strafe_amount
+                dy = sine * forward_amount + cosine * strafe_amount
+                self.player_x, self.player_y = engine.move_with_collision(
+                    self.player_x, self.player_y, dx, dy
+                )
+                remaining -= step
+            self._sync_local_player(now)
+            return True
         while remaining > 0:
             step = min(MOVEMENT_STEP_SECONDS, remaining)
             self.player_heading = engine.wrap_angle(
@@ -811,6 +878,7 @@ class BadgeBludApp(app.App):
             )
             remaining -= step
         self._sync_local_player(now)
+        return True
 
     def _fire(self, now):
         if self.map_open or self.countdown_ms > 0:
@@ -888,6 +956,7 @@ class BadgeBludApp(app.App):
                     self.player_x = player.x
                     self.player_y = player.y
                     self.player_heading = player.heading
+                self.render_dirty = True
 
     def _winner_at_timeout(self):
         if not self.players:
@@ -903,6 +972,7 @@ class BadgeBludApp(app.App):
         ending = protocol.pack_end(self.session, self._next_sequence(), winner)
         self._send_to_clients(ending, repeats=2)
         self.mode = RESULTS
+        self.render_dirty = True
 
     def _broadcast_beacon(self, now):
         phase = protocol.PHASE_LOBBY if self.mode == HOST_LOBBY else protocol.PHASE_MATCH
@@ -984,12 +1054,15 @@ class BadgeBludApp(app.App):
             self._ensure_radio()
         now = _ticks_ms()
         if "F" in self.pressed:
-            self.pressed.clear()
             self.minimise()
-            return False
+            # A rendered update enters the scheduler's foreground gate
+            # immediately, so this cached app instance cannot continue updating
+            # between the pop request and its eventual relaunch.
+            return True
 
         dt_ms = max(0, min(MAX_MOVEMENT_DELTA_MS, int(delta)))
         dt = dt_ms * 0.001
+        effects_were_active = bool(self.muzzle_ms or self.hit_ms)
         self.muzzle_ms = max(0, self.muzzle_ms - dt_ms)
         self.hit_ms = max(0, self.hit_ms - dt_ms)
 
@@ -1002,7 +1075,8 @@ class BadgeBludApp(app.App):
                 self.map_open = not self.map_open
             self._refresh_countdown(now)
             if self.countdown_ms <= 0:
-                self._update_movement(dt, now)
+                if self._update_movement(dt, now):
+                    self.render_dirty = True
                 if "C" in self.pressed:
                     self._fire(now)
         elif self.mode == RESULTS and "C" in self.pressed:
@@ -1040,8 +1114,12 @@ class BadgeBludApp(app.App):
                 elif _ticks_diff(now, self.last_pose) >= POSE_INTERVAL_MS:
                     self._send_pose(now)
 
+        if self.mode == MATCH:
+            self._refresh_hud_cache()
+        needs_render = self.render_dirty or effects_were_active
+        self.render_dirty = False
         self.pressed.clear()
-        return True
+        return True if needs_render else False
 
     @staticmethod
     def _setup_text(ctx, size=11):
@@ -1102,10 +1180,10 @@ class BadgeBludApp(app.App):
         ctx.rgb(0.65, 0.72, 0.82).move_to(0, 104).text(self.status[:28])
 
     def _visible_players(self):
-        visible = []
+        visible = self.visible_players
+        visible.clear()
         sine = math.sin(self.player_heading)
         cosine = math.cos(self.player_heading)
-        focal = 120.0 / math.tan(engine.FOV * 0.5)
         for slot, player in self.players.items():
             if slot == self.local_slot or player.dead:
                 continue
@@ -1115,7 +1193,7 @@ class BadgeBludApp(app.App):
             lateral = -dx * sine + dy * cosine
             if forward <= 0.15:
                 continue
-            screen_x = lateral * focal / forward
+            screen_x = lateral * PROJECTION_FOCAL / forward
             if screen_x < -132 or screen_x > 132:
                 continue
             column = int((screen_x + 120.0) * self.raycaster.count / 240.0)
@@ -1132,16 +1210,15 @@ class BadgeBludApp(app.App):
         depths, shades = self.raycaster.cast(
             self.player_x, self.player_y, self.player_heading
         )
-        column_width = 240.0 / self.raycaster.count
         for shade, colour in enumerate(WALL_COLOURS):
             ctx.rgb(*colour).begin_path()
             for index in range(self.raycaster.count):
                 if shades[index] == shade:
                     height = engine.clamp(150.0 / depths[index], 8.0, 240.0)
                     ctx.rectangle(
-                        -120.0 + index * column_width,
+                        self.column_x[index],
                         -height * 0.5,
-                        column_width + 0.5,
+                        self.column_width + 0.5,
                         height,
                     )
             ctx.fill()
@@ -1154,11 +1231,9 @@ class BadgeBludApp(app.App):
             ).fill()
 
         ctx.rgb(0.92, 0.96, 1.0).begin_path()
-        ctx.move_to(-6, 0).line_to(-2, 0)
-        ctx.move_to(2, 0).line_to(6, 0)
-        ctx.move_to(0, -6).line_to(0, -2)
-        ctx.move_to(0, 2).line_to(0, 6)
-        ctx.stroke()
+        ctx.rectangle(-6, -0.5, 12, 1)
+        ctx.rectangle(-0.5, -6, 1, 12)
+        ctx.fill()
         if self.muzzle_ms:
             ctx.rgb(1.0, 0.72, 0.12).arc(0, 20, 5, 0, engine.TAU, False).fill()
         if self.hit_ms:
@@ -1184,10 +1259,14 @@ class BadgeBludApp(app.App):
             size = 6.5 if slot == self.local_slot else 5.0
             cosine = math.cos(player.heading)
             sine = math.sin(player.heading)
+            left_cosine = cosine * MAP_ARROW_COSINE - sine * MAP_ARROW_SINE
+            left_sine = sine * MAP_ARROW_COSINE + cosine * MAP_ARROW_SINE
+            right_cosine = cosine * MAP_ARROW_COSINE + sine * MAP_ARROW_SINE
+            right_sine = sine * MAP_ARROW_COSINE - cosine * MAP_ARROW_SINE
             ctx.rgb(*PLAYER_COLOURS[slot]).begin_path()
             ctx.move_to(x + cosine * size, y + sine * size)
-            ctx.line_to(x + math.cos(player.heading + 2.45) * size, y + math.sin(player.heading + 2.45) * size)
-            ctx.line_to(x + math.cos(player.heading - 2.45) * size, y + math.sin(player.heading - 2.45) * size)
+            ctx.line_to(x + left_cosine * size, y + left_sine * size)
+            ctx.line_to(x + right_cosine * size, y + right_sine * size)
             ctx.close_path().fill()
 
     @staticmethod
@@ -1195,14 +1274,31 @@ class BadgeBludApp(app.App):
         seconds = max(0, milliseconds) // 1000
         return "%d:%02d" % (seconds // 60, seconds % 60)
 
-    def _draw_match_hud(self, ctx):
+    def _refresh_hud_cache(self):
         player = self._local_player()
         health = player.health if player is not None else 0
         kills = player.kills if player is not None else 0
+        displayed_second = max(0, self.remaining_ms) // 1000
+        if (
+            health != self.hud_health
+            or kills != self.hud_kills
+            or displayed_second != self.hud_second
+        ):
+            self.hud_health = health
+            self.hud_kills = kills
+            self.hud_second = displayed_second
+            self.hud_text = "HP %03d   K %02d   %s" % (
+                health,
+                kills,
+                self._format_time(self.remaining_ms),
+            )
+            self.render_dirty = True
+
+    def _draw_match_hud(self, ctx):
+        player = self._local_player()
+        self._refresh_hud_cache()
         self._setup_text(ctx, 10)
-        ctx.rgb(0.96, 0.98, 1.0).move_to(0, -108).text(
-            "HP %03d   K %02d   %s" % (health, kills, self._format_time(self.remaining_ms))
-        )
+        ctx.rgb(0.96, 0.98, 1.0).move_to(0, -108).text(self.hud_text)
         ctx.move_to(0, 109).text("C FIRE   B MAP   A+NUB STRAFE")
         if self.countdown_ms > 0:
             self._setup_text(ctx, 30)
